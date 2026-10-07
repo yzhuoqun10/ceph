@@ -103,6 +103,20 @@ def simplified_keyring(entity: str, contents: str) -> str:
     return keyring
 
 
+def _get_dashboard_server_addr(svc: 'CephadmService', daemon_id: str, hostname: str) -> str:
+    """Get the address where the dashboard listens for a given mgr daemon.
+
+    Reads the dashboard module's server_addr config (per-daemon first, then
+    global fallback via the localized option lookup). If the address is a
+    wildcard (``::`` or ``0.0.0.0``) or not configured, returns the host's
+    FQDN from the cephadm inventory.
+    """
+    server_addr = svc.mgr._ceph_get_module_option('dashboard', 'server_addr', daemon_id)
+    if server_addr and str(server_addr) not in ('::', '0.0.0.0'):
+        return str(server_addr)
+    return svc.mgr.get_fqdn(hostname)
+
+
 def get_dashboard_endpoints(svc: 'CephadmService') -> Tuple[List[str], Optional[str]]:
     dashboard_endpoints: List[str] = []
     port = None
@@ -113,14 +127,12 @@ def get_dashboard_endpoints(svc: 'CephadmService') -> Tuple[List[str], Optional[
         p_result = urlparse(url.rstrip('/'))
         protocol = p_result.scheme
         port = p_result.port
-        # assume that they are all dashboards on the same port as the active mgr.
         for dd in svc.mgr.cache.get_daemons_by_service('mgr'):
             if not port:
                 continue
             assert dd.hostname is not None
-            # fqdn may already be a name or numeric address; ensure IPv6
-            # literals are bracketed.
-            addr = svc.mgr.get_fqdn(dd.hostname)
+            assert dd.daemon_id is not None
+            addr = _get_dashboard_server_addr(svc, dd.daemon_id, dd.hostname)
             dashboard_endpoints.append(f'{wrap_ipv6(addr)}:{port}')
 
     return dashboard_endpoints, protocol
@@ -135,7 +147,11 @@ def get_dashboard_urls(svc: 'CephadmService') -> List[str]:
     url = mgr_map.get('services', {}).get('dashboard', None)
     if url:
         p_result = urlparse(url.rstrip('/'))
-        hostname = socket.getfqdn(p_result.hostname)
+        server_addr = svc.mgr._ceph_get_module_option('dashboard', 'server_addr', svc.mgr.get_mgr_id())
+        if server_addr and str(server_addr) not in ('::', '0.0.0.0'):
+            hostname = str(server_addr)
+        else:
+            hostname = socket.getfqdn(p_result.hostname)
         try:
             ip = ipaddress.ip_address(hostname)
         except ValueError:
@@ -154,7 +170,8 @@ def get_dashboard_urls(svc: 'CephadmService') -> List[str]:
         if dd.daemon_id == svc.mgr.get_mgr_id():
             continue
         assert dd.hostname is not None
-        addr = svc.mgr.get_fqdn(dd.hostname)
+        assert dd.daemon_id is not None
+        addr = _get_dashboard_server_addr(svc, dd.daemon_id, dd.hostname)
         dashboard_urls.append(build_url(scheme=proto, host=addr, port=port).rstrip('/'))
 
     return dashboard_urls
@@ -2237,6 +2254,10 @@ class CephadmAgent(CephService):
     TYPE = 'agent'
 
     @classmethod
+    def _get_ceph_volume_image(cls, mgr: "CephadmOrchestrator") -> str:
+        return mgr.get_container_image('osd') or ''
+
+    @classmethod
     def _get_service_dependencies(
         cls,
         mgr: "CephadmOrchestrator",
@@ -2251,12 +2272,14 @@ class CephadmAgent(CephService):
         complete dependency set.
         """
         agent = mgr.http_server.agent
+        container_image = cls._get_ceph_volume_image(mgr)
         return sorted(
             [
                 str(mgr.get_mgr_ip()),
                 str(agent.server_port),
                 mgr.cert_mgr.get_root_ca(),
                 str(mgr.get_module_option("device_enhanced_scan")),
+                container_image,
             ]
         )
 
@@ -2295,11 +2318,13 @@ class CephadmAgent(CephService):
             raise OrchestratorError(
                 'Cannot deploy agent daemons until cephadm endpoint has finished generating certs')
 
+        container_image = self._get_ceph_volume_image(self.mgr)
         cfg = {'target_ip': self.mgr.get_mgr_ip(),
                'target_port': agent.server_port,
                'refresh_period': self.mgr.agent_refresh_rate,
                'listener_port': self.mgr.agent_starting_port,
                'host': daemon_spec.host,
+               'container_image': container_image,
                'device_enhanced_scan': str(self.mgr.device_enhanced_scan)}
 
         tls_creds = self.get_certificates(daemon_spec)

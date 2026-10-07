@@ -504,7 +504,11 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
                   addr: Optional[str] = None,
                   labels: Optional[List[str]] = None,
                   maintenance: Optional[bool] = False) -> HandleCommandResult:
-        """Add a host"""
+        """
+        Add a host. For more than one label, use --labels label1,label2,... or
+        list them after <addr> separated by spaces (without <addr>, the first
+        label is taken as the address).
+        """
         _status = 'maintenance' if maintenance else ''
 
         # split multiple labels passed in with --labels=label1,label2
@@ -1543,6 +1547,14 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
             dg_specs = []
             for dg in drivegroups:
                 spec = DriveGroupSpec.from_json(dg)
+                # incentivize users to provide a service id for their OSD specs
+                # we can't make this part of the spec validation itself because
+                # it would cause us to drop previously working specs during upgrade,
+                # but we can do it for new specs
+                if not spec.service_id:
+                    raise SpecValidationError(
+                        'OSD spec with no service_id field found. Please provide a service_id for all OSD specs'
+                    )
                 if dry_run:
                     spec.preview_only = True
                 dg_specs.append(spec)
@@ -2193,6 +2205,10 @@ Usage:
     @OrchestratorCLICommand.Write('orch apply oauth2-proxy')
     def _apply_oauth2_proxy(self,
                             https_address: Optional[str] = None,
+                            provider_display_name: Optional[str] = None,
+                            oidc_issuer_url: Optional[str] = None,
+                            client_id: Optional[str] = None,
+                            client_secret: Optional[str] = None,
                             placement: Optional[str] = None,
                             unmanaged: bool = False,
                             dry_run: bool = False,
@@ -2207,6 +2223,10 @@ Usage:
             placement=PlacementSpec.from_string(placement),
             unmanaged=unmanaged,
             https_address=https_address,
+            provider_display_name=provider_display_name,
+            oidc_issuer_url=oidc_issuer_url,
+            client_id=client_id,
+            client_secret=client_secret,
         )
         spec.preview_only = dry_run
 

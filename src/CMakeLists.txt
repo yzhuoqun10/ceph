@@ -539,6 +539,9 @@ set(libcommon_files
   include/filepath.cc
   include/invoke_date.cc
   include/object.cc
+  include/client_t.cc
+  include/errorcode32.cc
+  include/shard_id.cc
   include/types.cc
   include/utime.cc
   include/uuid.cc
@@ -616,7 +619,6 @@ set(ceph_common_deps
   Boost::program_options
   Boost::date_time
   Boost::iostreams
-  StdFilesystem::filesystem
   ${FMT_LIB}
   ${BLKID_LIBRARIES}
   ${Backtrace_LIBRARIES}

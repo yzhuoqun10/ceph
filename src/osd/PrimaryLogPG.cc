@@ -2075,6 +2075,13 @@ void PrimaryLogPG::do_op_impl(OpRequestRef op)
       osd->handle_misdirected_op(this, op);
       return;
     }
+    // some requests such as watch/notify/notify_ack can only be handled by the primary,
+    // fail these with EAGAIN to get the client to retry against the primary.
+    if (!is_primary() && op->is_primary_only()) {
+      dout(10) << __func__ << " op must be processed by primary, returning EAGAIN" << dendl;
+      osd->reply_op_error(op, -EAGAIN);
+      return;
+    }
   } else {
     // normal case; must be primary
     if (!is_primary()) {
@@ -15974,15 +15981,13 @@ bool PrimaryLogPG::_range_available_for_scrub(const hobject_t& begin,
 int PrimaryLogPG::rep_repair_primary_object(const hobject_t& soid, OpContext *ctx)
 {
   OpRequestRef op = ctx->op;
-  // Only supports replicated pools
-  ceph_assert(!pool.info.is_erasure());
 
-  if (!is_primary()) {
-    // Must be a balanced/localized read that has failed on a replica.
-    // Replicas cannot run recovery, so the request need to be
+  if (!is_primary() || pool.info.is_erasure()) {
+    // Must be a balanced/localized read that has failed on a replica, or
+    // an EC direct read. Neither can run recovery, so the request needs to be
     // failed with EAGAIN to the client which will then retry the
     // request to the primary
-    dout(10) << __func__ << " not primary, failing op with EAGAIN" << dendl;
+    dout(10) << __func__ << " not primary or EC direct, failing op with EAGAIN" << dendl;
     osd->reply_op_error(op, -EAGAIN);
     return -EAGAIN;
   }

@@ -2898,6 +2898,23 @@ options:
   default: 0
   services:
   - rgw
+  flags:
+  - runtime
+  with_legacy: true
+- name: rgw_sync_data_inject_err_list
+  type: str
+  level: dev
+  desc: object keys and error codes for data sync error injection
+  long_desc: Intended for multisite testing. Accepts a comma-separated list of
+    `key=errno` entries. When non-empty, error injection only applies to object
+    keys with an exact match in this list, using the corresponding positive
+    errno value. When empty, error injection defaults to EIO.
+  services:
+  - rgw
+  flags:
+  - runtime
+  see_also:
+  - rgw_sync_data_inject_err_probability
   with_legacy: true
 - name: rgw_sync_meta_inject_err_probability
   type: float
@@ -3214,6 +3231,17 @@ options:
   level: advanced
   desc: Requests including encryption key headers must be sent over ssl
   default: true
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_s3_block_sse_c_by_default
+  type: bool
+  level: advanced
+  desc: Block SSE-C uploads on newly created buckets
+  long_desc: When enabled, RGW configures all newly created buckets to block
+    SSE-C uploads. Existing buckets are not affected. Use PutBucketEncryption
+    to change this setting on a bucket.
+  default: false
   services:
   - rgw
   with_legacy: true
@@ -4449,14 +4477,13 @@ options:
   type: str
   level: advanced
   desc: experimental Option to set backend store type
-  long_desc: defaults to rados. Other valid values are dbstore, motr, and daos (All experimental).
+  long_desc: defaults to rados. Other valid values are dbstore and daos (All experimental).
   default: rados
   services:
   - rgw
   enum_values:
   - rados
   - dbstore
-  - motr
   - daos
   - posix
 - name: rgw_config_store
@@ -4512,61 +4539,6 @@ options:
   default: /var/lib/ceph/radosgw/config.json
   see_also:
   - rgw_config_store
-  services:
-  - rgw
-- name: motr_profile_fid
-  type: str
-  level: advanced
-  desc: experimental Option to set Motr profile fid
-  long_desc: example value 0x7000000000000001:0x4f
-  default: 0x7000000000000001:0x0
-  services:
-  - rgw
-- name: motr_my_fid
-  type: str
-  level: advanced
-  desc: experimental Option to set my Motr fid
-  long_desc: example value 0x7200000000000001:0x29
-  default: 0x7200000000000001:0x0
-  services:
-  - rgw
-- name: motr_admin_fid
-  type: str
-  level: advanced
-  desc: Admin Tool Motr FID for admin-level access.
-  long_desc: example value 0x7200000000000001:0x2c
-  default: 0x7200000000000001:0x0
-  services:
-  - rgw
-- name: motr_admin_endpoint
-  type: str
-  level: advanced
-  desc:  experimental Option to set Admin Motr endpoint address
-  long_desc: example value 192.168.180.182@tcp:12345:4:1
-  default: 192.168.180.182@tcp:12345:4:1
-  services:
-  - rgw
-- name: motr_my_endpoint
-  type: str
-  level: advanced
-  desc: experimental Option to set my Motr endpoint address
-  long_desc: example value 192.168.180.182@tcp:12345:4:1
-  default: 192.168.180.182@tcp:12345:4:1
-  services:
-  - rgw
-- name: motr_ha_endpoint
-  type: str
-  level: advanced
-  desc: experimental Option to set Motr HA agent endpoint address
-  long_desc: example value 192.168.180.182@tcp:12345:1:1
-  default: 192.168.180.182@tcp:12345:1:1
-  services:
-  - rgw
-- name: motr_tracing_enabled
-  type: bool
-  level: advanced
-  desc: Set to true when Motr client debugging is needed
-  default: false
   services:
   - rgw
 - name: rgw_posix_base_path

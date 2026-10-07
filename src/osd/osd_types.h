@@ -41,9 +41,11 @@
 #include "msg/msg_types.h"
 #include "include/common_fwd.h" // for CephContext
 #include "include/compat.h"
-#include "include/types.h"
+#include "include/container_ios.h"
+#include "include/errorcode32.h"
 #include "include/utime.h"
 #include "include/CompatSet.h"
+#include "common/bitset_set.h"
 #include "common/dout.h"
 #include "common/histogram.h" // for pow2_hist_t
 #include "include/interval_set.h"
@@ -381,6 +383,7 @@ enum {
   CEPH_OSD_RMW_FLAG_EC_DIRECT_READ  = (1 << 13),
   CEPH_OSD_RMW_FLAG_EC_SYNC_READ    = (1 << 14),
   CEPH_OSD_RMW_FLAG_CLASS_READ_DATA = (1 << 15),
+  CEPH_OSD_RMW_FLAG_PRIMARY_ONLY    = (1 << 16),
 };
 
 

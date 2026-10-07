@@ -145,6 +145,10 @@ os._exit = os_exit_noop   # type: ignore
 
 DEFAULT_IMAGE = 'quay.io/ceph/ceph'
 
+# Pool type constants from include/rados.h / pg_pool_t (CEPH_PG_TYPE_*)
+CEPH_POOL_TYPE_REPLICATED = 1
+CEPH_POOL_TYPE_ERASURE = 3
+
 
 def host_exists(hostname_position: int = 1) -> Callable:
     """Check that a hostname exists in the inventory"""
@@ -234,6 +238,15 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             type='secs',
             default=10 * 60,
             desc='How frequently to perform a host check',
+        ),
+        Option(
+            'upgrade_cpu_isa_check',
+            type='bool',
+            default=True,
+            desc='Before upgrading, verify that host CPUs support the x86-64 '
+            'microarchitecture level required by the target release; set to '
+            'false to skip the check (e.g. when using custom-built images '
+            'targeting an older CPU generation)',
         ),
         Option(
             'stray_daemon_check_interval',
@@ -611,6 +624,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             self.allow_lo_routes = False
             self.allow_bgp_routes = False
             self.host_check_interval = 0
+            self.upgrade_cpu_isa_check = True
             self.stray_daemon_check_interval = 0
             self.max_count_per_host = 0
             self.mode = ''
@@ -1246,6 +1260,18 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
                     return list(ifaces.values())[0][0]
                 logger.error(f'{spec_network} from {sspec.service_name()} spec does not overlap with {host_network} on {host}')
         return None
+
+    def get_bond_members(self, host: str, iface: str) -> Set[str]:
+        """Return the member devices of iface on host, empty if it is not a bond.
+
+        Read from the interface metadata already collected by 'cephadm
+        gather-facts', which reports a bond's member devices as its
+        lower_devs_list.
+        """
+        nic = self.cache.get_facts(host).get('interfaces', {}).get(iface, {})
+        if nic.get('nic_type') != 'bonding':
+            return set()
+        return set(nic.get('lower_devs_list') or [])
 
     @staticmethod
     def can_run() -> Tuple[bool, str]:
@@ -3879,6 +3905,36 @@ Then run the following:
             raise OrchestratorError(f'Cannot find pool "{pool}" for '
                                     f'service {service_name}')
 
+    def _check_pool_supports_omap(self, pool: str, service_name: str) -> None:
+        osd_map = self.get('osd_map')
+        pools = osd_map.get('pools', []) if isinstance(osd_map, dict) else []
+        pool_info = None
+        for p in pools:
+            if p.get('pool_name') == pool:
+                pool_info = p
+                break
+        if pool_info is None:
+            raise OrchestratorError(
+                f'Pool "{pool}" was not found in the OSD map. '
+                f'Cannot verify OMAP support for service "{service_name}".'
+            )
+        if pool_info.get('type') == CEPH_POOL_TYPE_REPLICATED:
+            return
+        flags_names = pool_info.get('flags_names', '')
+        flags_set = set(f.strip() for f in flags_names.split(',') if f.strip())
+        if 'supports_omap' in flags_set:
+            return
+        raise OrchestratorError(
+            f'Pool "{pool}" does not support OMAP. '
+            f'Service "{service_name}" requires a pool with OMAP support '
+            f'because it uses OMAP objects for gateway state. '
+            f'Use a replicated pool, or enable OMAP support on the '
+            f'erasure-coded pool with '
+            f'"ceph osd pool set {pool} allow_ec_optimizations true" '
+            f'(requires all OSDs to be running Umbrella or later; '
+            f'Crimson-backed EC pools do not support OMAP).'
+        )
+
     def _add_daemon(self,
                     daemon_type: str,
                     spec: ServiceSpec) -> List[str]:
@@ -4800,6 +4856,7 @@ Then run the following:
                 NvmeofMetadataPoolHelper(self).create_pool_if_needed()
             try:
                 self._check_pool_exists(nvmeof_spec.pool, nvmeof_spec.service_name())
+                self._check_pool_supports_omap(nvmeof_spec.pool, nvmeof_spec.service_name())
             except OrchestratorError as e:
                 self.log.debug(f"{e}")
                 raise
@@ -5000,6 +5057,11 @@ Then run the following:
         version_error = self.upgrade._check_target_version(ceph_image_version)
         if version_error:
             return f'Incompatible upgrade: {version_error}'
+        isa_errors = self.upgrade.check_host_cpu_isa_level(ceph_image_version)
+        if isa_errors:
+            return ('Incompatible upgrade: found host(s) with a CPU that '
+                    f'cannot run ceph version {ceph_image_version}:\n'
+                    + '\n'.join(self.upgrade._host_cpu_isa_error_detail(isa_errors)))
 
         self.log.debug(f'image info {image} -> {image_info}')
         r: dict = {
