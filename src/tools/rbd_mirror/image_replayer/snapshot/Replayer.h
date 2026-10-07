@@ -231,7 +231,18 @@ private:
   uint64_t m_local_snap_id_start = 0;
   uint64_t m_local_snap_id_end = CEPH_NOSNAP;
   cls::rbd::MirrorSnapshotNamespace m_local_mirror_snap_ns;
+  cls::rbd::MirrorSnapshotNamespace m_local_start_mirror_snap_ns;
   uint64_t m_local_object_count = 0;
+
+  // peer re-link: the local image was last synced from a different primary
+  // (m_local_start_mirror_snap_ns.primary_mirror_uuid) than the current
+  // remote; the remote's promote lineage is used to verify that both sides
+  // share that snapshot and to pick the remote promote snapshot as the
+  // delta start point
+  bool m_relink_checked = false;
+  bool m_relink_active = false;
+  uint64_t m_relink_promote_snap_id = CEPH_NOSNAP;
+  std::string m_relink_error;
 
   std::string m_remote_mirror_peer_uuid;
   uint64_t m_remote_snap_id_start = 0;
@@ -274,6 +285,11 @@ private:
 
   void scan_local_mirror_snapshots(std::unique_lock<ceph::mutex>* locker);
   void scan_remote_mirror_snapshots(std::unique_lock<ceph::mutex>* locker);
+
+  bool is_relink_required() const;
+  void load_remote_image_meta();
+  void handle_load_remote_image_meta(int r);
+  void validate_lineage();
 
   void prune_mirror_snapshot(uint64_t snap_id);
   void handle_prune_mirror_snapshot(int r);

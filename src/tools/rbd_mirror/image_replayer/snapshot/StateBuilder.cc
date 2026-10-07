@@ -32,6 +32,7 @@ StateBuilder<I>::StateBuilder(const std::string& global_image_id)
 template <typename I>
 StateBuilder<I>::~StateBuilder() {
   ceph_assert(local_image_meta == nullptr);
+  ceph_assert(remote_image_meta == nullptr);
 }
 
 template <typename I>
@@ -40,6 +41,8 @@ void StateBuilder<I>::close(Context* on_finish) {
 
   delete local_image_meta;
   local_image_meta = nullptr;
+  delete remote_image_meta;
+  remote_image_meta = nullptr;
 
   // close the remote image after closing the local
   // image in case the remote cluster is unreachable and

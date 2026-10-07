@@ -80,6 +80,10 @@ public:
 
   librbd::mirror::snapshot::ImageMeta<ImageCtxT>* local_image_meta = nullptr;
 
+  // lazily created by the replayer when the local image is linked to a
+  // primary other than the current remote (peer re-link after failover)
+  librbd::mirror::snapshot::ImageMeta<ImageCtxT>* remote_image_meta = nullptr;
+
 private:
   bool is_linked_impl() const override;
 };

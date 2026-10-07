@@ -374,6 +374,10 @@ void Replayer<I>::load_local_image_meta() {
     // reset state in case new snapshot is added while we are scanning
     std::unique_lock locker{m_lock};
     m_image_updated = false;
+    m_relink_checked = false;
+    m_relink_active = false;
+    m_relink_promote_snap_id = CEPH_NOSNAP;
+    m_relink_error.clear();
   }
 
   bool update_status = false;
@@ -488,6 +492,7 @@ void Replayer<I>::scan_local_mirror_snapshots(
   m_local_snap_id_start = 0;
   m_local_snap_id_end = CEPH_NOSNAP;
   m_local_mirror_snap_ns = {};
+  m_local_start_mirror_snap_ns = {};
   m_local_object_count = 0;
 
   m_remote_snap_id_start = 0;
@@ -516,6 +521,7 @@ void Replayer<I>::scan_local_mirror_snapshots(
       if (mirror_ns->complete) {
         // if remote has new snapshots, we would sync from here
         m_local_snap_id_start = local_snap_id;
+        m_local_start_mirror_snap_ns = *mirror_ns;
         ceph_assert(m_local_snap_id_end == CEPH_NOSNAP);
         const auto& peer_uuids = mirror_ns->mirror_peer_uuids;
         if (peer_uuids.empty() ||
@@ -559,6 +565,7 @@ void Replayer<I>::scan_local_mirror_snapshots(
           prune_snap_ids.insert(local_snap_id);
         }
         m_local_snap_id_start = local_snap_id;
+        m_local_start_mirror_snap_ns = *mirror_ns;
         ceph_assert(m_local_snap_id_end == CEPH_NOSNAP);
       } else {
         derr << "incomplete local primary snapshot" << dendl;
@@ -590,18 +597,9 @@ void Replayer<I>::scan_local_mirror_snapshots(
 
   if (m_local_snap_id_start > 0 || m_local_snap_id_end != CEPH_NOSNAP) {
     if (m_local_mirror_snap_ns.is_non_primary() &&
-        m_local_mirror_snap_ns.primary_mirror_uuid !=
-          m_state_builder->remote_mirror_uuid) {
-      if (m_local_mirror_snap_ns.is_orphan()) {
-        dout(5) << "local image being force promoted" << dendl;
-        handle_replay_complete(locker, 0, "orphan (force promoting)");
-        return;
-      }
-      // TODO support multiple peers
-      derr << "local image linked to unknown peer: "
-           << m_local_mirror_snap_ns.primary_mirror_uuid << dendl;
-      handle_replay_complete(locker, -EEXIST,
-                             "local image linked to unknown peer");
+        m_local_mirror_snap_ns.is_orphan()) {
+      dout(5) << "local image being force promoted" << dendl;
+      handle_replay_complete(locker, 0, "orphan (force promoting)");
       return;
     } else if (m_local_mirror_snap_ns.state ==
                  cls::rbd::MIRROR_SNAPSHOT_STATE_PRIMARY) {
@@ -610,12 +608,57 @@ void Replayer<I>::scan_local_mirror_snapshots(
       return;
     }
 
+    if (is_relink_required()) {
+      // the local image was last synced from a different primary than the
+      // current remote (e.g. a third site after a failover): verify the
+      // remote's promote lineage before re-linking to it
+      if (m_local_snap_id_end != CEPH_NOSNAP &&
+          m_local_mirror_snap_ns.primary_mirror_uuid !=
+            m_state_builder->remote_mirror_uuid) {
+        // HEAD contains a partially applied delta from the previous primary
+        // that the current remote cannot complete
+        derr << "in-progress sync from previous primary "
+             << m_local_mirror_snap_ns.primary_mirror_uuid
+             << ": resync required" << dendl;
+        handle_replay_complete(
+          locker, -EEXIST,
+          "in-progress sync from previous primary: resync required");
+        return;
+      }
+      if (!m_relink_checked) {
+        locker->unlock();
+        load_remote_image_meta();
+        return;
+      } else if (!m_relink_active) {
+        derr << "local image linked to unknown peer: "
+             << m_local_start_mirror_snap_ns.primary_mirror_uuid << ": "
+             << m_relink_error << dendl;
+        handle_replay_complete(locker, -EEXIST, m_relink_error);
+        return;
+      }
+      dout(5) << "re-linking local image from "
+              << m_local_start_mirror_snap_ns.primary_mirror_uuid << "@"
+              << m_local_start_mirror_snap_ns.primary_snap_id << " to "
+              << m_state_builder->remote_mirror_uuid << " at promote snapshot "
+              << m_relink_promote_snap_id << dendl;
+    } else if (m_local_mirror_snap_ns.is_non_primary() &&
+               m_local_mirror_snap_ns.primary_mirror_uuid !=
+                 m_state_builder->remote_mirror_uuid) {
+      // in-progress snapshot from a third primary: cannot be resumed from
+      // the current remote
+      derr << "local image linked to unknown peer: "
+           << m_local_mirror_snap_ns.primary_mirror_uuid << dendl;
+      handle_replay_complete(locker, -EEXIST,
+                             "local image linked to unknown peer");
+      return;
+    }
+
     dout(10) << "found local mirror snapshot: "
              << "local_snap_id_start=" << m_local_snap_id_start << ", "
              << "local_snap_id_end=" << m_local_snap_id_end << ", "
              << "local_snap_ns=" << m_local_mirror_snap_ns << dendl;
     if (!m_local_mirror_snap_ns.is_primary() &&
-        m_local_mirror_snap_ns.complete) {
+        m_local_mirror_snap_ns.complete && !m_relink_active) {
       // our remote sync should start after this completed snapshot
       m_remote_snap_id_start = m_local_mirror_snap_ns.primary_snap_id;
     }
@@ -655,6 +698,17 @@ void Replayer<I>::scan_remote_mirror_snapshots(
       handle_replay_complete(locker, -EINVAL,
                              "invalid remote mirror snapshot state");
       return;
+    } else if (m_relink_active &&
+               snap_info_it->first == m_relink_promote_snap_id) {
+      // the remote promote snapshot holds the same data as our local start
+      // snapshot (both are the previous primary's snapshot we were in sync
+      // with), so it is the delta start point; it will not list us as a
+      // peer since we were not registered with the remote when it was taken
+      dout(10) << "using remote promote snapshot " << snap_info_it->first
+               << " as re-link start" << dendl;
+      m_remote_snap_id_start = snap_info_it->first;
+      m_remote_mirror_snap_ns = *mirror_ns;
+      continue;
     } else if (mirror_ns->mirror_peer_uuids.count(m_remote_mirror_peer_uuid) ==
                  0) {
       dout(15) << "skipping remote snapshot due to missing mirror peer"
@@ -666,16 +720,28 @@ void Replayer<I>::scan_remote_mirror_snapshots(
     if (m_local_snap_id_start > 0 || m_local_snap_id_end != CEPH_NOSNAP) {
       // we have a local mirror snapshot
       if (m_local_mirror_snap_ns.is_non_primary()) {
-        // previously validated that it was linked to remote
-        ceph_assert(m_local_mirror_snap_ns.primary_mirror_uuid ==
+        // previously validated that it was linked to remote (or is being
+        // re-linked via the remote's promote lineage)
+        ceph_assert(m_relink_active ||
+                    m_local_mirror_snap_ns.primary_mirror_uuid ==
                       m_state_builder->remote_mirror_uuid);
 
         if (m_remote_snap_id_end == CEPH_NOSNAP) {
           // haven't found the end snap so treat this as a candidate for unlink
           unlink_snap_ids.insert(remote_snap_id);
         }
-        if (m_local_mirror_snap_ns.complete &&
-            m_local_mirror_snap_ns.primary_snap_id >= remote_snap_id) {
+        if (m_relink_active && m_local_mirror_snap_ns.complete) {
+          // local snapshot ids refer to the previous primary and cannot be
+          // compared against the remote's; everything after the promote
+          // snapshot is new to us
+          if (remote_snap_id < m_relink_promote_snap_id) {
+            // stays an unlink candidate: we will never sync it
+            dout(15) << "skipping pre-promote remote snapshot "
+                     << remote_snap_id << dendl;
+            continue;
+          }
+        } else if (m_local_mirror_snap_ns.complete &&
+                   m_local_mirror_snap_ns.primary_snap_id >= remote_snap_id) {
           // skip past completed remote snapshot
           m_remote_snap_id_start = remote_snap_id;
           m_remote_mirror_snap_ns = *mirror_ns;
@@ -730,6 +796,17 @@ void Replayer<I>::scan_remote_mirror_snapshots(
     // first primary snapshot where were are listed as a peer
     m_remote_snap_id_end = remote_snap_id;
     m_remote_mirror_snap_ns = *mirror_ns;
+  }
+
+  if (m_relink_active && m_remote_snap_id_start == 0) {
+    // the promote snapshot recorded in the remote lineage has already been
+    // rotated away; without it there is no common data point to delta from
+    image_locker.unlock();
+    derr << "remote promote snapshot " << m_relink_promote_snap_id
+         << " no longer exists: resync required" << dendl;
+    handle_replay_complete(
+      locker, -EEXIST, "lineage anchor pruned on remote: resync required");
+    return;
   }
 
   if (m_remote_snap_id_start != 0 &&
@@ -814,6 +891,93 @@ void Replayer<I>::scan_remote_mirror_snapshots(
   m_state = STATE_IDLE;
 
   notify_status_updated();
+}
+
+template <typename I>
+bool Replayer<I>::is_relink_required() const {
+  return (m_local_snap_id_start > 0 &&
+          m_local_start_mirror_snap_ns.is_non_primary() &&
+          m_local_start_mirror_snap_ns.complete &&
+          !m_local_start_mirror_snap_ns.is_orphan() &&
+          m_local_start_mirror_snap_ns.primary_mirror_uuid !=
+            m_state_builder->remote_mirror_uuid);
+}
+
+template <typename I>
+void Replayer<I>::load_remote_image_meta() {
+  dout(10) << "remote_mirror_uuid=" << m_state_builder->remote_mirror_uuid
+           << dendl;
+
+  if (m_state_builder->remote_image_meta == nullptr) {
+    m_state_builder->remote_image_meta =
+      librbd::mirror::snapshot::ImageMeta<I>::create(
+        m_state_builder->remote_image_ctx,
+        m_state_builder->remote_mirror_uuid);
+  }
+
+  auto ctx = create_context_callback<
+    Replayer<I>, &Replayer<I>::handle_load_remote_image_meta>(this);
+  m_state_builder->remote_image_meta->load(ctx);
+}
+
+template <typename I>
+void Replayer<I>::handle_load_remote_image_meta(int r) {
+  dout(10) << "r=" << r << dendl;
+
+  std::unique_lock locker{m_lock};
+  m_relink_checked = true;
+  if (r == -ENOENT) {
+    m_relink_error = "lineage unverifiable: remote has no promote record: "
+                     "resync required";
+  } else if (r < 0) {
+    derr << "failed to load remote image-meta: " << cpp_strerror(r) << dendl;
+    handle_replay_complete(&locker, r, "failed to load remote image-meta");
+    return;
+  } else {
+    validate_lineage();
+  }
+
+  scan_local_mirror_snapshots(&locker);
+}
+
+template <typename I>
+void Replayer<I>::validate_lineage() {
+  ceph_assert(ceph_mutex_is_locked(m_lock));
+
+  const auto& previous_mirror_uuid =
+    m_local_start_mirror_snap_ns.primary_mirror_uuid;
+  uint64_t local_primary_snap_id =
+    m_local_start_mirror_snap_ns.primary_snap_id;
+
+  // newest promote record that descends from the primary we were linked to
+  const librbd::mirror::snapshot::LineageEntry* entry = nullptr;
+  for (auto& candidate : m_state_builder->remote_image_meta->lineage) {
+    if (candidate.from_mirror_uuid == previous_mirror_uuid) {
+      entry = &candidate;
+    }
+  }
+
+  if (entry == nullptr) {
+    m_relink_error = "lineage unverifiable: remote was not promoted from " +
+                     previous_mirror_uuid + ": resync required";
+    return;
+  }
+
+  dout(10) << "local=" << previous_mirror_uuid << "@" << local_primary_snap_id
+           << ", remote lineage=" << *entry << dendl;
+
+  if (entry->from_snap_id != local_primary_snap_id) {
+    // TODO: delta-forward (local behind) and rollback (local ahead) re-link
+    m_relink_error = "lineage mismatch: local in sync with " +
+                     previous_mirror_uuid + "@" +
+                     stringify(local_primary_snap_id) +
+                     " but remote was promoted from @" +
+                     stringify(entry->from_snap_id) + ": resync required";
+    return;
+  }
+
+  m_relink_active = true;
+  m_relink_promote_snap_id = entry->promote_snap_id;
 }
 
 template <typename I>
@@ -1001,10 +1165,12 @@ void Replayer<I>::create_non_primary_snapshot() {
       }
 
       uint64_t local_snap_id = CEPH_NOSNAP;
-      if (mirror_ns->is_demoted() && !m_remote_mirror_snap_ns.is_demoted()) {
-        // if we are creating a non-primary snapshot following a demotion,
-        // re-build the full snapshot sequence since we don't have a valid
-        // snapshot mapping
+      if ((mirror_ns->is_demoted() && !m_remote_mirror_snap_ns.is_demoted()) ||
+          m_relink_active) {
+        // if we are creating a non-primary snapshot following a demotion or
+        // a re-link to a new primary, re-build the full snapshot sequence
+        // since we don't have a valid snapshot mapping (the local mapping
+        // refers to the previous primary's snapshot ids)
         auto local_snap_id_it = local_image_ctx->snap_ids.find(
           {remote_snap_info.snap_namespace, remote_snap_info.name});
         if (local_snap_id_it != local_image_ctx->snap_ids.end()) {

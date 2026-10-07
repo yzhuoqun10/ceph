@@ -212,7 +212,26 @@ struct ImageMeta<MockTestImageCtx> {
   MOCK_METHOD1(load, void(Context*));
 
   bool resync_requested = false;
+  std::vector<LineageEntry> lineage;
+
+  // the replayer lazily creates the remote image-meta via create(); route it
+  // to the most recently constructed mock (ownership stays with the test
+  // since the mock StateBuilder never deletes it)
+  std::string mirror_uuid;
+  static ImageMeta* s_instance;
+  static ImageMeta* create(MockTestImageCtx* image_ctx,
+                           const std::string& mirror_uuid) {
+    ceph_assert(s_instance != nullptr);
+    s_instance->mirror_uuid = mirror_uuid;
+    return s_instance;
+  }
+
+  ImageMeta() {
+    s_instance = this;
+  }
 };
+
+ImageMeta<MockTestImageCtx>* ImageMeta<MockTestImageCtx>::s_instance = nullptr;
 
 template <>
 struct UnlinkPeerRequest<MockTestImageCtx> {
@@ -363,6 +382,8 @@ struct StateBuilder<librbd::MockTestImageCtx> {
 
   librbd::mirror::snapshot::ImageMeta<librbd::MockTestImageCtx>*
     local_image_meta = nullptr;
+  librbd::mirror::snapshot::ImageMeta<librbd::MockTestImageCtx>*
+    remote_image_meta = nullptr;
 };
 
 ApplyImageStateRequest<librbd::MockTestImageCtx>* ApplyImageStateRequest<librbd::MockTestImageCtx>::s_instance = nullptr;
@@ -470,6 +491,29 @@ public:
           mock_image_meta.resync_requested = resync_requested;
           m_threads->work_queue->queue(ctx, r);
         }));
+  }
+
+  void expect_load_remote_image_meta(
+      MockImageMeta& mock_remote_image_meta,
+      const std::vector<librbd::mirror::snapshot::LineageEntry>& lineage,
+      int r) {
+    EXPECT_CALL(mock_remote_image_meta, load(_))
+      .WillOnce(Invoke([this, &mock_remote_image_meta, lineage, r]
+                       (Context* ctx) {
+          mock_remote_image_meta.lineage = lineage;
+          m_threads->work_queue->queue(ctx, r);
+        }));
+  }
+
+  librbd::mirror::snapshot::LineageEntry make_lineage_entry(
+      const std::string& from_mirror_uuid, uint64_t from_snap_id,
+      uint64_t promote_snap_id) {
+    librbd::mirror::snapshot::LineageEntry entry;
+    entry.from_mirror_uuid = from_mirror_uuid;
+    entry.from_snap_id = from_snap_id;
+    entry.local_snap_id = 1;
+    entry.promote_snap_id = promote_snap_id;
+    return entry;
   }
 
   void expect_is_refresh_required(librbd::MockTestImageCtx& mock_image_ctx,
@@ -2886,6 +2930,309 @@ TEST_F(TestMockImageReplayerSnapshotReplayer, SplitBrain) {
   ASSERT_FALSE(mock_replayer.is_replaying());
   ASSERT_EQ(-EEXIST, mock_replayer.get_error_code());
   ASSERT_EQ(std::string{"split-brain"}, mock_replayer.get_error_description());
+
+  ASSERT_EQ(0, shut_down_entry_replayer(mock_replayer, mock_threads,
+                                        mock_local_image_ctx,
+                                        mock_remote_image_ctx));
+}
+
+TEST_F(TestMockImageReplayerSnapshotReplayer, RelinkAfterFailover) {
+  librbd::MockTestImageCtx mock_local_image_ctx{*m_local_image_ctx};
+  librbd::MockTestImageCtx mock_remote_image_ctx{*m_remote_image_ctx};
+
+  MockThreads mock_threads(m_threads);
+  expect_work_queue_repeatedly(mock_threads);
+
+  MockReplayerListener mock_replayer_listener;
+  expect_notification(mock_threads, mock_replayer_listener);
+
+  InSequence seq;
+
+  MockInstanceWatcher mock_instance_watcher;
+  MockImageMeta mock_image_meta;
+  MockStateBuilder mock_state_builder(mock_local_image_ctx,
+                                      mock_remote_image_ctx,
+                                      mock_image_meta);
+  MockReplayer mock_replayer{&mock_threads, &mock_instance_watcher,
+                             "local mirror uuid", "local mirror peer uuid",
+                             &m_pool_meta_cache, &mock_state_builder,
+                             &mock_replayer_listener};
+  m_pool_meta_cache.set_remote_pool_meta(
+    m_remote_fsid, m_remote_io_ctx.get_id(),
+    {"remote mirror uuid", "remote mirror peer uuid"});
+
+  librbd::UpdateWatchCtx* update_watch_ctx = nullptr;
+  ASSERT_EQ(0, init_entry_replayer(mock_replayer, mock_threads,
+                                   mock_local_image_ctx,
+                                   mock_remote_image_ctx,
+                                   mock_replayer_listener,
+                                   mock_image_meta,
+                                   &update_watch_ctx));
+
+  // local image was last in sync with a previous primary (@100); the remote
+  // was promoted from that same snapshot (promote snapshot 5, which does not
+  // list us as a peer) and has since taken a new mirror snapshot (6)
+  mock_local_image_ctx.snap_info = {
+    {11U, librbd::SnapInfo{"snap11", cls::rbd::MirrorSnapshotNamespace{
+       cls::rbd::MIRROR_SNAPSHOT_STATE_NON_PRIMARY, {}, "previous mirror uuid",
+       100, true, 0, {{100, CEPH_NOSNAP}}},
+     0, {}, 0, 0, {}}}};
+  mock_remote_image_ctx.snap_info = {
+    {5U, librbd::SnapInfo{"snap5", cls::rbd::MirrorSnapshotNamespace{
+       cls::rbd::MIRROR_SNAPSHOT_STATE_PRIMARY, {"other peer uuid"},
+       "", CEPH_NOSNAP, true, 0, {}},
+     0, {}, 0, 0, {}}},
+    {6U, librbd::SnapInfo{"snap6", cls::rbd::MirrorSnapshotNamespace{
+       cls::rbd::MIRROR_SNAPSHOT_STATE_PRIMARY, {"remote mirror peer uuid"},
+       "", CEPH_NOSNAP, true, 0, {}},
+     0, {}, 0, 0, {}}}};
+
+  // re-link and sync snap6 as a delta from the promote snapshot
+  expect_load_image_meta(mock_image_meta, false, 0);
+  expect_is_refresh_required(mock_remote_image_ctx, false);
+  expect_is_refresh_required(mock_local_image_ctx, false);
+  MockImageMeta mock_remote_image_meta;
+  expect_load_remote_image_meta(
+    mock_remote_image_meta,
+    {make_lineage_entry("previous mirror uuid", 100, 5)}, 0);
+  MockSnapshotCopyRequest mock_snapshot_copy_request;
+  expect_snapshot_copy(mock_snapshot_copy_request, 5, 6, 11, {{6, CEPH_NOSNAP}},
+                       0);
+  MockGetImageStateRequest mock_get_image_state_request;
+  expect_get_image_state(mock_get_image_state_request, 6, 0);
+  MockCreateNonPrimaryRequest mock_create_non_primary_request;
+  expect_create_non_primary_request(mock_create_non_primary_request,
+                                    false, "remote mirror uuid", 6,
+                                    {{6, CEPH_NOSNAP}}, 14, 0);
+  expect_notify_sync_request(mock_instance_watcher, mock_local_image_ctx.id, 0);
+  MockImageCopyRequest mock_image_copy_request;
+  expect_image_copy(mock_image_copy_request, 5, 6, 11, {},
+                    {{6, CEPH_NOSNAP}}, 0);
+  MockApplyImageStateRequest mock_apply_state_request;
+  expect_apply_image_state(mock_apply_state_request, 0);
+  expect_mirror_image_snapshot_set_copy_progress(
+    mock_local_image_ctx, 14, true, 0, 0);
+  expect_notify_update(mock_local_image_ctx);
+  MockUnlinkPeerRequest mock_unlink_peer_request;
+  expect_unlink_peer(mock_unlink_peer_request, 5, "remote mirror peer uuid",
+                     false, 0);
+  expect_notify_sync_complete(mock_instance_watcher, mock_local_image_ctx.id);
+
+  // idle: now linked to the current remote, no lineage lookup needed
+  expect_load_image_meta(mock_image_meta, false, 0);
+  expect_is_refresh_required(mock_remote_image_ctx, false);
+  expect_is_refresh_required(mock_local_image_ctx, true);
+  expect_refresh(
+    mock_local_image_ctx, {
+      {14U, librbd::SnapInfo{"snap14", cls::rbd::MirrorSnapshotNamespace{
+         cls::rbd::MIRROR_SNAPSHOT_STATE_NON_PRIMARY, {}, "remote mirror uuid",
+         6, true, 0, {}},
+       0, {}, 0, 0, {}}},
+    }, 0);
+
+  // wake-up replayer
+  update_watch_ctx->handle_notify();
+
+  // wait for sync to complete
+  ASSERT_EQ(0, wait_for_notification(2));
+  ASSERT_EQ("remote mirror uuid", mock_remote_image_meta.mirror_uuid);
+
+  ASSERT_EQ(0, shut_down_entry_replayer(mock_replayer, mock_threads,
+                                        mock_local_image_ctx,
+                                        mock_remote_image_ctx));
+}
+
+TEST_F(TestMockImageReplayerSnapshotReplayer, RelinkLineageMismatch) {
+  librbd::MockTestImageCtx mock_local_image_ctx{*m_local_image_ctx};
+  librbd::MockTestImageCtx mock_remote_image_ctx{*m_remote_image_ctx};
+
+  MockThreads mock_threads(m_threads);
+  expect_work_queue_repeatedly(mock_threads);
+
+  MockReplayerListener mock_replayer_listener;
+  expect_notification(mock_threads, mock_replayer_listener);
+
+  InSequence seq;
+
+  MockInstanceWatcher mock_instance_watcher;
+  MockImageMeta mock_image_meta;
+  MockStateBuilder mock_state_builder(mock_local_image_ctx,
+                                      mock_remote_image_ctx,
+                                      mock_image_meta);
+  MockReplayer mock_replayer{&mock_threads, &mock_instance_watcher,
+                             "local mirror uuid", "local mirror peer uuid",
+                             &m_pool_meta_cache, &mock_state_builder,
+                             &mock_replayer_listener};
+  m_pool_meta_cache.set_remote_pool_meta(
+    m_remote_fsid, m_remote_io_ctx.get_id(),
+    {"remote mirror uuid", "remote mirror peer uuid"});
+
+  librbd::UpdateWatchCtx* update_watch_ctx = nullptr;
+  ASSERT_EQ(0, init_entry_replayer(mock_replayer, mock_threads,
+                                   mock_local_image_ctx,
+                                   mock_remote_image_ctx,
+                                   mock_replayer_listener,
+                                   mock_image_meta,
+                                   &update_watch_ctx));
+
+  // local is in sync with @100 but the remote was promoted from @102
+  mock_local_image_ctx.snap_info = {
+    {11U, librbd::SnapInfo{"snap11", cls::rbd::MirrorSnapshotNamespace{
+       cls::rbd::MIRROR_SNAPSHOT_STATE_NON_PRIMARY, {}, "previous mirror uuid",
+       100, true, 0, {}},
+     0, {}, 0, 0, {}}}};
+  mock_remote_image_ctx.snap_info = {
+    {5U, librbd::SnapInfo{"snap5", cls::rbd::MirrorSnapshotNamespace{
+       cls::rbd::MIRROR_SNAPSHOT_STATE_PRIMARY, {"remote mirror peer uuid"},
+       "", CEPH_NOSNAP, true, 0, {}},
+     0, {}, 0, 0, {}}}};
+
+  expect_load_image_meta(mock_image_meta, false, 0);
+  expect_is_refresh_required(mock_remote_image_ctx, false);
+  expect_is_refresh_required(mock_local_image_ctx, false);
+  MockImageMeta mock_remote_image_meta;
+  expect_load_remote_image_meta(
+    mock_remote_image_meta,
+    {make_lineage_entry("previous mirror uuid", 102, 5)}, 0);
+
+  // wake-up replayer
+  update_watch_ctx->handle_notify();
+
+  ASSERT_EQ(0, wait_for_notification(1));
+  ASSERT_FALSE(mock_replayer.is_replaying());
+  ASSERT_EQ(-EEXIST, mock_replayer.get_error_code());
+  ASSERT_EQ(std::string{"lineage mismatch: local in sync with previous mirror "
+                        "uuid@100 but remote was promoted from @102: resync "
+                        "required"},
+            mock_replayer.get_error_description());
+
+  ASSERT_EQ(0, shut_down_entry_replayer(mock_replayer, mock_threads,
+                                        mock_local_image_ctx,
+                                        mock_remote_image_ctx));
+}
+
+TEST_F(TestMockImageReplayerSnapshotReplayer, RelinkNoLineage) {
+  librbd::MockTestImageCtx mock_local_image_ctx{*m_local_image_ctx};
+  librbd::MockTestImageCtx mock_remote_image_ctx{*m_remote_image_ctx};
+
+  MockThreads mock_threads(m_threads);
+  expect_work_queue_repeatedly(mock_threads);
+
+  MockReplayerListener mock_replayer_listener;
+  expect_notification(mock_threads, mock_replayer_listener);
+
+  InSequence seq;
+
+  MockInstanceWatcher mock_instance_watcher;
+  MockImageMeta mock_image_meta;
+  MockStateBuilder mock_state_builder(mock_local_image_ctx,
+                                      mock_remote_image_ctx,
+                                      mock_image_meta);
+  MockReplayer mock_replayer{&mock_threads, &mock_instance_watcher,
+                             "local mirror uuid", "local mirror peer uuid",
+                             &m_pool_meta_cache, &mock_state_builder,
+                             &mock_replayer_listener};
+  m_pool_meta_cache.set_remote_pool_meta(
+    m_remote_fsid, m_remote_io_ctx.get_id(),
+    {"remote mirror uuid", "remote mirror peer uuid"});
+
+  librbd::UpdateWatchCtx* update_watch_ctx = nullptr;
+  ASSERT_EQ(0, init_entry_replayer(mock_replayer, mock_threads,
+                                   mock_local_image_ctx,
+                                   mock_remote_image_ctx,
+                                   mock_replayer_listener,
+                                   mock_image_meta,
+                                   &update_watch_ctx));
+
+  // remote (e.g. older release) has no image-meta at all
+  mock_local_image_ctx.snap_info = {
+    {11U, librbd::SnapInfo{"snap11", cls::rbd::MirrorSnapshotNamespace{
+       cls::rbd::MIRROR_SNAPSHOT_STATE_NON_PRIMARY, {}, "previous mirror uuid",
+       100, true, 0, {}},
+     0, {}, 0, 0, {}}}};
+
+  expect_load_image_meta(mock_image_meta, false, 0);
+  expect_is_refresh_required(mock_remote_image_ctx, false);
+  expect_is_refresh_required(mock_local_image_ctx, false);
+  MockImageMeta mock_remote_image_meta;
+  expect_load_remote_image_meta(mock_remote_image_meta, {}, -ENOENT);
+
+  // wake-up replayer
+  update_watch_ctx->handle_notify();
+
+  ASSERT_EQ(0, wait_for_notification(1));
+  ASSERT_FALSE(mock_replayer.is_replaying());
+  ASSERT_EQ(-EEXIST, mock_replayer.get_error_code());
+  ASSERT_EQ(std::string{"lineage unverifiable: remote has no promote record: "
+                        "resync required"},
+            mock_replayer.get_error_description());
+
+  ASSERT_EQ(0, shut_down_entry_replayer(mock_replayer, mock_threads,
+                                        mock_local_image_ctx,
+                                        mock_remote_image_ctx));
+}
+
+TEST_F(TestMockImageReplayerSnapshotReplayer, RelinkPromoteSnapshotPruned) {
+  librbd::MockTestImageCtx mock_local_image_ctx{*m_local_image_ctx};
+  librbd::MockTestImageCtx mock_remote_image_ctx{*m_remote_image_ctx};
+
+  MockThreads mock_threads(m_threads);
+  expect_work_queue_repeatedly(mock_threads);
+
+  MockReplayerListener mock_replayer_listener;
+  expect_notification(mock_threads, mock_replayer_listener);
+
+  InSequence seq;
+
+  MockInstanceWatcher mock_instance_watcher;
+  MockImageMeta mock_image_meta;
+  MockStateBuilder mock_state_builder(mock_local_image_ctx,
+                                      mock_remote_image_ctx,
+                                      mock_image_meta);
+  MockReplayer mock_replayer{&mock_threads, &mock_instance_watcher,
+                             "local mirror uuid", "local mirror peer uuid",
+                             &m_pool_meta_cache, &mock_state_builder,
+                             &mock_replayer_listener};
+  m_pool_meta_cache.set_remote_pool_meta(
+    m_remote_fsid, m_remote_io_ctx.get_id(),
+    {"remote mirror uuid", "remote mirror peer uuid"});
+
+  librbd::UpdateWatchCtx* update_watch_ctx = nullptr;
+  ASSERT_EQ(0, init_entry_replayer(mock_replayer, mock_threads,
+                                   mock_local_image_ctx,
+                                   mock_remote_image_ctx,
+                                   mock_replayer_listener,
+                                   mock_image_meta,
+                                   &update_watch_ctx));
+
+  // lineage matches but the promote snapshot (5) has been rotated away
+  mock_local_image_ctx.snap_info = {
+    {11U, librbd::SnapInfo{"snap11", cls::rbd::MirrorSnapshotNamespace{
+       cls::rbd::MIRROR_SNAPSHOT_STATE_NON_PRIMARY, {}, "previous mirror uuid",
+       100, true, 0, {}},
+     0, {}, 0, 0, {}}}};
+  mock_remote_image_ctx.snap_info = {
+    {6U, librbd::SnapInfo{"snap6", cls::rbd::MirrorSnapshotNamespace{
+       cls::rbd::MIRROR_SNAPSHOT_STATE_PRIMARY, {"remote mirror peer uuid"},
+       "", CEPH_NOSNAP, true, 0, {}},
+     0, {}, 0, 0, {}}}};
+
+  expect_load_image_meta(mock_image_meta, false, 0);
+  expect_is_refresh_required(mock_remote_image_ctx, false);
+  expect_is_refresh_required(mock_local_image_ctx, false);
+  MockImageMeta mock_remote_image_meta;
+  expect_load_remote_image_meta(
+    mock_remote_image_meta,
+    {make_lineage_entry("previous mirror uuid", 100, 5)}, 0);
+
+  // wake-up replayer
+  update_watch_ctx->handle_notify();
+
+  ASSERT_EQ(0, wait_for_notification(1));
+  ASSERT_FALSE(mock_replayer.is_replaying());
+  ASSERT_EQ(-EEXIST, mock_replayer.get_error_code());
+  ASSERT_EQ(std::string{"lineage anchor pruned on remote: resync required"},
+            mock_replayer.get_error_description());
 
   ASSERT_EQ(0, shut_down_entry_replayer(mock_replayer, mock_threads,
                                         mock_local_image_ctx,
