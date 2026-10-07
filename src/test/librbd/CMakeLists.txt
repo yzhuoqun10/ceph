@@ -105,6 +105,7 @@ set(unittest_librbd_srcs
   mirror/snapshot/test_mock_CreatePrimaryRequest.cc
   mirror/snapshot/test_mock_ImageMeta.cc
   mirror/snapshot/test_mock_PromoteRequest.cc
+  mirror/snapshot/test_mock_RecordLineageRequest.cc
   mirror/snapshot/test_mock_UnlinkPeerRequest.cc
   mirror/snapshot/test_mock_Utils.cc
   mirror/test_mock_DisableRequest.cc

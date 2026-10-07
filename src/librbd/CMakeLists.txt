@@ -161,6 +161,7 @@ set(librbd_internal_srcs
   mirror/snapshot/GetImageStateRequest.cc
   mirror/snapshot/ImageMeta.cc
   mirror/snapshot/PromoteRequest.cc
+  mirror/snapshot/RecordLineageRequest.cc
   mirror/snapshot/RemoveImageStateRequest.cc
   mirror/snapshot/SetImageStateRequest.cc
   mirror/snapshot/Types.cc

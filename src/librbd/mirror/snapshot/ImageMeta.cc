@@ -25,9 +25,64 @@ namespace snapshot {
 using librbd::util::create_rados_callback;
 using librbd::mirror::snapshot::util::get_image_meta_key;
 
+namespace {
+
+json_spirit::mObject lineage_to_json(const LineageEntry& entry) {
+  json_spirit::mObject obj;
+  obj["from_mirror_uuid"] = entry.from_mirror_uuid;
+  obj["from_snap_id"] = entry.from_snap_id;
+  obj["local_snap_id"] = entry.local_snap_id;
+  obj["promote_snap_id"] = entry.promote_snap_id;
+  obj["forced"] = entry.forced;
+  obj["timestamp"] = entry.timestamp;
+  json_spirit::mObject snap_seqs;
+  for (auto& [from, local] : entry.snap_seqs) {
+    snap_seqs[std::to_string(from)] = local;
+  }
+  obj["snap_seqs"] = snap_seqs;
+  return obj;
+}
+
+LineageEntry lineage_from_json(const json_spirit::mObject& obj) {
+  LineageEntry entry;
+  entry.from_mirror_uuid = obj.at("from_mirror_uuid").get_str();
+  entry.from_snap_id = obj.at("from_snap_id").get_uint64();
+  entry.local_snap_id = obj.at("local_snap_id").get_uint64();
+  entry.promote_snap_id = obj.at("promote_snap_id").get_uint64();
+  entry.forced = obj.at("forced").get_bool();
+  entry.timestamp = obj.at("timestamp").get_uint64();
+  for (auto& [from, local] : obj.at("snap_seqs").get_obj()) {
+    entry.snap_seqs[std::stoull(from)] = local.get_uint64();
+  }
+  return entry;
+}
+
+} // anonymous namespace
+
+std::ostream& operator<<(std::ostream& os, const LineageEntry& entry) {
+  os << "["
+     << "from_mirror_uuid=" << entry.from_mirror_uuid << ", "
+     << "from_snap_id=" << entry.from_snap_id << ", "
+     << "local_snap_id=" << entry.local_snap_id << ", "
+     << "promote_snap_id=" << entry.promote_snap_id << ", "
+     << "forced=" << entry.forced << ", "
+     << "snap_seqs=" << entry.snap_seqs << ", "
+     << "timestamp=" << entry.timestamp << "]";
+  return os;
+}
+
 template <typename I>
 ImageMeta<I>::ImageMeta(I* image_ctx, const std::string& mirror_uuid)
   : m_image_ctx(image_ctx), m_mirror_uuid(mirror_uuid) {
+}
+
+template <typename I>
+void ImageMeta<I>::add_lineage(const LineageEntry& entry) {
+  lineage.push_back(entry);
+  if (lineage.size() > MAX_LINEAGE_ENTRIES) {
+    lineage.erase(lineage.begin(),
+                  lineage.begin() + (lineage.size() - MAX_LINEAGE_ENTRIES));
+  }
 }
 
 template <typename I>
@@ -78,8 +133,19 @@ void ImageMeta<I>::handle_load(Context* on_finish, int r) {
     try {
       auto& json_obj = json_root.get_obj();
       resync_requested = json_obj["resync_requested"].get_bool();
+
+      // optional: absent in image-meta written by older releases
+      lineage.clear();
+      auto it = json_obj.find("lineage");
+      if (it != json_obj.end()) {
+        for (auto& val : it->second.get_array()) {
+          lineage.push_back(lineage_from_json(val.get_obj()));
+        }
+      }
       json_valid = true;
     } catch (std::runtime_error&) {
+    } catch (std::out_of_range&) {
+    } catch (std::invalid_argument&) {
     }
   }
 
@@ -98,12 +164,18 @@ void ImageMeta<I>::save(Context* on_finish) {
                               << "key=" << get_image_meta_key(m_mirror_uuid)
                               << dendl;
 
-  // simple implementation for now
-  std::string json = "{\"resync_requested\": " +
-                     std::string(resync_requested ? "true" : "false") + "}";
+  json_spirit::mObject json_obj;
+  json_obj["resync_requested"] = resync_requested;
+  if (!lineage.empty()) {
+    json_spirit::mArray json_lineage;
+    for (auto& entry : lineage) {
+      json_lineage.push_back(lineage_to_json(entry));
+    }
+    json_obj["lineage"] = json_lineage;
+  }
 
   bufferlist bl;
-  bl.append(json);
+  bl.append(json_spirit::write(json_obj));
 
   // avoid using built-in metadata_set operation since that would require
   // opening the non-primary image in read/write mode which isn't supported

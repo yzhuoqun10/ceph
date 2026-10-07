@@ -12,6 +12,7 @@
 #include "librbd/mirror/snapshot/CreateNonPrimaryRequest.h"
 #include "librbd/mirror/snapshot/CreatePrimaryRequest.h"
 #include "librbd/mirror/snapshot/PromoteRequest.h"
+#include "librbd/mirror/snapshot/RecordLineageRequest.h"
 #include "librbd/mirror/snapshot/Utils.h"
 
 namespace librbd {
@@ -142,6 +143,29 @@ struct CreatePrimaryRequest<MockTestImageCtx> {
 
 CreatePrimaryRequest<MockTestImageCtx>* CreatePrimaryRequest<MockTestImageCtx>::s_instance = nullptr;
 
+template <>
+struct RecordLineageRequest<MockTestImageCtx> {
+  LineageEntry entry;
+  Context* on_finish = nullptr;
+  static RecordLineageRequest* s_instance;
+  static RecordLineageRequest *create(MockTestImageCtx *image_ctx,
+                                      const LineageEntry& entry,
+                                      Context *on_finish) {
+    ceph_assert(s_instance != nullptr);
+    s_instance->entry = entry;
+    s_instance->on_finish = on_finish;
+    return s_instance;
+  }
+
+  MOCK_METHOD0(send, void());
+
+  RecordLineageRequest() {
+    s_instance = this;
+  }
+};
+
+RecordLineageRequest<MockTestImageCtx>* RecordLineageRequest<MockTestImageCtx>::s_instance = nullptr;
+
 } // namespace snapshot
 } // namespace mirror
 } // namespace librbd
@@ -169,7 +193,36 @@ public:
   typedef PromoteRequest<MockTestImageCtx> MockPromoteRequest;
   typedef CreateNonPrimaryRequest<MockTestImageCtx> MockCreateNonPrimaryRequest;
   typedef CreatePrimaryRequest<MockTestImageCtx> MockCreatePrimaryRequest;
+  typedef RecordLineageRequest<MockTestImageCtx> MockRecordLineageRequest;
   typedef util::Mock MockUtils;
+
+  // make the mock image look like a replica that is in sync with
+  // primary_mirror_uuid@primary_snap_id
+  void add_non_primary_snapshot(MockTestImageCtx &mock_image_ctx,
+                                uint64_t snap_id,
+                                const std::string& primary_mirror_uuid,
+                                uint64_t primary_snap_id, bool complete,
+                                bool demoted = false) {
+    cls::rbd::MirrorSnapshotNamespace ns{
+      (demoted ? cls::rbd::MIRROR_SNAPSHOT_STATE_NON_PRIMARY_DEMOTED :
+                 cls::rbd::MIRROR_SNAPSHOT_STATE_NON_PRIMARY),
+      {}, primary_mirror_uuid, primary_snap_id};
+    ns.complete = complete;
+    ns.snap_seqs = {{primary_snap_id, snap_id}};
+    mock_image_ctx.snap_info.emplace(
+      snap_id, SnapInfo{"snap" + stringify(snap_id), ns, 0, {}, 0, 0, {}});
+  }
+
+  void expect_record_lineage(
+      MockTestImageCtx &mock_image_ctx,
+      MockRecordLineageRequest &mock_record_lineage_request, int r) {
+    EXPECT_CALL(mock_record_lineage_request, send())
+      .WillOnce(
+        Invoke([&mock_image_ctx, &mock_record_lineage_request, r]() {
+                 mock_image_ctx.image_ctx->op_work_queue->queue(
+                   mock_record_lineage_request.on_finish, r);
+               }));
+  }
 
   void expect_can_create_primary_snapshot(MockUtils &mock_utils, bool force,
                                           bool requires_orphan,
@@ -360,6 +413,97 @@ TEST_F(TestMockMirrorSnapshotPromoteRequest, SuccessRollback) {
   auto req = new MockPromoteRequest(&mock_image_ctx, "gid", &ctx);
   req->send();
   ASSERT_EQ(0, ctx.wait());
+}
+
+TEST_F(TestMockMirrorSnapshotPromoteRequest, SuccessRecordsLineage) {
+  REQUIRE_FORMAT_V2();
+
+  librbd::ImageCtx *ictx;
+  ASSERT_EQ(0, open_image(m_image_name, &ictx));
+
+  MockTestImageCtx mock_image_ctx(*ictx);
+  expect_op_work_queue(mock_image_ctx);
+
+  // orderly failover: last snapshot is the synced demotion snapshot of the
+  // previous primary; an older synced snapshot must be ignored
+  add_non_primary_snapshot(mock_image_ctx, 5, "uuid-a", 100, true);
+  add_non_primary_snapshot(mock_image_ctx, 7, "uuid-a", 102, true, true);
+
+  InSequence seq;
+
+  MockUtils mock_utils;
+  expect_can_create_primary_snapshot(mock_utils, true, false, CEPH_NOSNAP,
+                                     true);
+  MockCreatePrimaryRequest mock_create_primary_request;
+  expect_create_promote_snapshot(mock_image_ctx, mock_create_primary_request,
+                                 0);
+  MockRecordLineageRequest mock_record_lineage_request;
+  expect_record_lineage(mock_image_ctx, mock_record_lineage_request, 0);
+
+  C_SaferCond ctx;
+  auto req = new MockPromoteRequest(&mock_image_ctx, "gid", &ctx);
+  req->send();
+  ASSERT_EQ(0, ctx.wait());
+
+  auto& entry = mock_record_lineage_request.entry;
+  ASSERT_EQ("uuid-a", entry.from_mirror_uuid);
+  ASSERT_EQ(102U, entry.from_snap_id);
+  ASSERT_EQ(7U, entry.local_snap_id);
+  ASSERT_FALSE(entry.forced);
+  ASSERT_EQ((std::map<uint64_t, uint64_t>{{102, 7}}), entry.snap_seqs);
+  ASSERT_NE(0U, entry.timestamp);
+}
+
+TEST_F(TestMockMirrorSnapshotPromoteRequest, ForceRecordsRollbackAnchor) {
+  REQUIRE_FORMAT_V2();
+
+  librbd::ImageCtx *ictx;
+  ASSERT_EQ(0, open_image(m_image_name, &ictx));
+
+  MockTestImageCtx mock_image_ctx(*ictx);
+  expect_op_work_queue(mock_image_ctx);
+
+  MockExclusiveLock mock_exclusive_lock;
+  if (ictx->test_features(RBD_FEATURE_EXCLUSIVE_LOCK)) {
+    mock_image_ctx.exclusive_lock = &mock_exclusive_lock;
+  }
+
+  // unplanned failover mid-sync: snapshot 9 is incomplete, we roll back to 5
+  add_non_primary_snapshot(mock_image_ctx, 5, "uuid-a", 100, true);
+  add_non_primary_snapshot(mock_image_ctx, 9, "uuid-a", 104, false);
+
+  InSequence seq;
+
+  MockUtils mock_utils;
+  expect_can_create_primary_snapshot(mock_utils, true, false, 5, true);
+  MockCreateNonPrimaryRequest mock_create_non_primary_request;
+  expect_create_orphan_snapshot(mock_image_ctx, mock_create_non_primary_request,
+                                0);
+  MockListWatchersRequest mock_list_watchers_request;
+  expect_list_watchers(mock_image_ctx, mock_list_watchers_request, {}, 0);
+  expect_acquire_lock(mock_image_ctx, 0);
+
+  SnapInfo snap_info = {"snap", cls::rbd::MirrorSnapshotNamespace{}, 0,
+                        {}, 0, 0, {}};
+  expect_rollback(mock_image_ctx, 5, &snap_info, 0);
+  MockCreatePrimaryRequest mock_create_primary_request;
+  expect_create_promote_snapshot(mock_image_ctx, mock_create_primary_request,
+                                 0);
+  MockRecordLineageRequest mock_record_lineage_request;
+  expect_record_lineage(mock_image_ctx, mock_record_lineage_request, -EIO);
+  expect_release_lock(mock_image_ctx, 0);
+
+  C_SaferCond ctx;
+  auto req = new MockPromoteRequest(&mock_image_ctx, "gid", &ctx);
+  req->send();
+  // lineage recording failure must not fail the promotion
+  ASSERT_EQ(0, ctx.wait());
+
+  auto& entry = mock_record_lineage_request.entry;
+  ASSERT_EQ("uuid-a", entry.from_mirror_uuid);
+  ASSERT_EQ(100U, entry.from_snap_id);
+  ASSERT_EQ(5U, entry.local_snap_id);
+  ASSERT_TRUE(entry.forced);
 }
 
 TEST_F(TestMockMirrorSnapshotPromoteRequest, ErrorCannotRollback) {

@@ -9,6 +9,7 @@
 #include "common/ceph_mutex.h"
 #include "common/Timer.h"
 #include "librbd/internal.h"
+#include "librbd/mirror/snapshot/ImageMeta.h"
 
 #include <string>
 #include <set>
@@ -66,6 +67,9 @@ private:
    *    v                                         |
    * CREATE_PROMOTE_SNAPSHOT <--------------------/
    *    |
+   *    v (skip if image was never a replica; errors are non-fatal)
+   * RECORD_LINEAGE
+   *    |
    *    v
    * DISABLE_NON_PRIMARY_FEATURE
    *    |
@@ -85,6 +89,10 @@ private:
   uint64_t m_rollback_snap_id = CEPH_NOSNAP;
   bool m_lock_acquired = false;
   NoOpProgressContext m_progress_ctx;
+
+  uint64_t m_promote_snap_id = CEPH_NOSNAP;
+  bool m_has_lineage = false;
+  LineageEntry m_lineage_entry;
 
   class UpdateWatchCtx : public librbd::UpdateWatchCtx {
   public:
@@ -131,6 +139,9 @@ private:
 
   void create_promote_snapshot();
   void handle_create_promote_snapshot(int r);
+
+  void record_lineage();
+  void handle_record_lineage(int r);
 
   void disable_non_primary_feature();
   void handle_disable_non_primary_feature(int r);

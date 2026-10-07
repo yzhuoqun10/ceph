@@ -2,6 +2,7 @@
 // vim: ts=8 sw=2 sts=2 expandtab
 
 #include "librbd/mirror/snapshot/PromoteRequest.h"
+#include "common/Clock.h"
 #include "common/Timer.h"
 #include "common/dout.h"
 #include "common/errno.h"
@@ -15,6 +16,7 @@
 #include "librbd/image/ListWatchersRequest.h"
 #include "librbd/mirror/snapshot/CreateNonPrimaryRequest.h"
 #include "librbd/mirror/snapshot/CreatePrimaryRequest.h"
+#include "librbd/mirror/snapshot/RecordLineageRequest.h"
 #include "librbd/mirror/snapshot/Utils.h"
 
 #include <shared_mutex> // for std::shared_lock
@@ -42,7 +44,37 @@ void PromoteRequest<I>::send() {
     lderr(cct) << "cannot promote" << dendl;
     finish(-EINVAL);
     return;
-  } else if (m_rollback_snap_id == CEPH_NOSNAP && !requires_orphan) {
+  }
+
+  // remember which previous-primary snapshot this image is in sync with so
+  // other replicas of that primary can later re-link to us without a resync
+  {
+    std::shared_lock image_locker{m_image_ctx->image_lock};
+    for (auto it = m_image_ctx->snap_info.rbegin();
+         it != m_image_ctx->snap_info.rend(); ++it) {
+      auto mirror_ns = std::get_if<cls::rbd::MirrorSnapshotNamespace>(
+        &it->second.snap_namespace);
+      if (mirror_ns == nullptr || !mirror_ns->is_non_primary() ||
+          !mirror_ns->complete || mirror_ns->is_orphan()) {
+        continue;
+      }
+      if (m_rollback_snap_id != CEPH_NOSNAP && it->first != m_rollback_snap_id) {
+        continue;
+      }
+      m_has_lineage = true;
+      m_lineage_entry.from_mirror_uuid = mirror_ns->primary_mirror_uuid;
+      m_lineage_entry.from_snap_id = mirror_ns->primary_snap_id;
+      m_lineage_entry.local_snap_id = it->first;
+      m_lineage_entry.forced = requires_orphan ||
+                               m_rollback_snap_id != CEPH_NOSNAP;
+      m_lineage_entry.snap_seqs = mirror_ns->snap_seqs;
+      break;
+    }
+  }
+  ldout(cct, 15) << "has_lineage=" << m_has_lineage << ", "
+                 << "lineage=" << m_lineage_entry << dendl;
+
+  if (m_rollback_snap_id == CEPH_NOSNAP && !requires_orphan) {
     create_promote_snapshot();
     return;
   }
@@ -301,7 +333,7 @@ void PromoteRequest<I>::create_promote_snapshot() {
     m_image_ctx, m_global_image_id, CEPH_NOSNAP,
     SNAP_CREATE_FLAG_SKIP_NOTIFY_QUIESCE,
     (snapshot::CREATE_PRIMARY_FLAG_IGNORE_EMPTY_PEERS |
-     snapshot::CREATE_PRIMARY_FLAG_FORCE), nullptr, ctx);
+     snapshot::CREATE_PRIMARY_FLAG_FORCE), &m_promote_snap_id, ctx);
   req->send();
 }
 
@@ -315,6 +347,42 @@ void PromoteRequest<I>::handle_create_promote_snapshot(int r) {
                << dendl;
     finish(r);
     return;
+  }
+
+  record_lineage();
+}
+
+template <typename I>
+void PromoteRequest<I>::record_lineage() {
+  if (!m_has_lineage) {
+    disable_non_primary_feature();
+    return;
+  }
+
+  CephContext *cct = m_image_ctx->cct;
+  ldout(cct, 15) << dendl;
+
+  m_lineage_entry.promote_snap_id = m_promote_snap_id;
+  m_lineage_entry.timestamp = ceph_clock_now().sec();
+
+  auto ctx = create_context_callback<
+    PromoteRequest<I>,
+    &PromoteRequest<I>::handle_record_lineage>(this);
+  auto req = RecordLineageRequest<I>::create(m_image_ctx, m_lineage_entry,
+                                             ctx);
+  req->send();
+}
+
+template <typename I>
+void PromoteRequest<I>::handle_record_lineage(int r) {
+  CephContext *cct = m_image_ctx->cct;
+  ldout(cct, 15) << "r=" << r << dendl;
+
+  if (r < 0) {
+    // the image is already primary at this point; losing the lineage record
+    // only costs a resync on re-link later, so do not fail the promotion
+    lderr(cct) << "failed to record promote lineage (non-fatal): "
+               << cpp_strerror(r) << dendl;
   }
 
   disable_non_primary_feature();
